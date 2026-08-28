@@ -128,6 +128,61 @@ além da stdlib.
 memória por processo, mas não tem campos `drm-engine-*`. Não existe tempo de NPU
 por processo — utilização só global.
 
+## Custo de CPU, e como ele foi reduzido
+
+O pipeline inteiro custava **51% de um núcleo**. Duas medições cortaram isso:
+
+**O pool de threads do OpenCV era desperdício.** Com os 8 threads padrão, o custo
+era 12,84 ms de CPU por frame para 8,47 ms de parede. Com `setNumThreads(1)`:
+7,28 ms de CPU para **exatamente os mesmos** 8,47 ms de parede. A paralelização
+gastava 43% mais CPU em sincronização para entregar a mesma latência, porque as
+operações são pequenas e o orçamento por frame (33 ms) é folgado. É o padrão
+agora; `--cv-threads 0` volta ao automático.
+
+**Onde vai a CPU restante**, medido a 1280×720 com um thread:
+
+| Etapa | CPU/frame |
+|---|---|
+| Decode MJPG da câmera | 4,66 ms |
+| `segment()` — inclui a NPU | 3,15 ms |
+| `compose()` do blur | 4,53 ms |
+| `cvtColor` BGR→RGB | 0,19 ms |
+
+A inferência na NPU são 0,94 ms desse total: **7%**. O caro é decodificar e
+compor pixel. Trocar MJPG por YUYV eliminaria o decode, mas webcams USB só
+oferecem YUYV em resoluções baixas — é limite de banda, não escolha.
+
+## Modo ocioso
+
+Por padrão o serviço **dorme quando ninguém está consumindo** a câmera virtual:
+não lê a webcam, não infere, não compõe, e **solta o `/dev/video0`** para outros
+aplicativos. Custo em repouso: **2,5% de um núcleo** contra 51% antes.
+
+Ele continua repetindo o último quadro a 2 fps, e isso não é opcional — parar de
+transmitir faria o `exclusive_caps` devolver o device a *Video Output*, e ele
+sumiria da lista de câmeras do navegador sem disparar `devicechange`.
+
+Acorda em até um segundo quando alguém abre o `/dev/video9`, reabrindo a webcam.
+Medido: 150 de 150 quadros entregues a um consumidor que chegou com o serviço
+dormindo. `--idle-after 0` desliga o comportamento.
+
+Como efeito colateral, isso **resolve boa parte da limitação de um usuário por
+vez**: enquanto ninguém usa o blur, a webcam fica livre para qualquer um.
+
+## Taxa de quadros caindo pela metade no fim do dia
+
+Se o pipeline cair para 15 fps quando escurece, não é ele — é a webcam. Webcams
+UVC cortam a taxa pela metade para dobrar o tempo de exposição com pouca luz. O
+controle é `exposure_dynamic_framerate`, cujo padrão é 0, mas que aparece ligado:
+
+```bash
+v4l2-ctl -d /dev/video0 --set-ctrl=exposure_dynamic_framerate=0
+```
+
+Isso mantém o auto-exposure e só proíbe a queda de taxa. O `blur_cam.py` já
+aplica sozinho ao abrir a câmera. Medido: 15,0 fps ligado, 29,8 fps desligado,
+mesma cena.
+
 ## Limitações conhecidas
 
 - **Um usuário por vez.** Existe uma câmera física e um `/dev/video9`. Enquanto
