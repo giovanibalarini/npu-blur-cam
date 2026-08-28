@@ -1,0 +1,26 @@
+# Unit de usuario. Instale em /etc/systemd/user/ para valer a todos os
+# usuarios da maquina, ou em ~/.config/systemd/user/ para um so.
+# Habilite na sessao de cada usuario: systemctl --user enable --now npu-blur-cam
+#
+# ATENCAO: enquanto rodar, este servico segura a camera fisica em exclusivo.
+# Nenhum outro app consegue a camera crua, e dois usuarios nunca podem
+# rodar o pipeline ao mesmo tempo — existe um /dev/video9 so.
+[Unit]
+Description=Camera virtual com blur de fundo rodando na NPU (Intel AI Boost)
+Documentation=https://github.com/giovanibalarini/npu-blur-cam
+After=default.target
+# se a camera fisica estiver ocupada, tenta 3x e desiste em vez de girar pra sempre
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# espera o /dev/video9 aparecer — o v4l2loopback vem do systemd-modules-load, no boot
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/video9 ] && exit 0; sleep 1; done; echo "npu-blur-cam: /dev/video9 nao apareceu em 30s" >&2; exit 1'
+ExecStart=/opt/npu-blur-cam/venv/bin/python /opt/npu-blur-cam/blur_cam.py
+WorkingDirectory=/opt/npu-blur-cam
+Restart=on-failure
+RestartSec=10
+# logs no journal: journalctl --user -u npu-blur-cam -f
+[Install]
+WantedBy=default.target
