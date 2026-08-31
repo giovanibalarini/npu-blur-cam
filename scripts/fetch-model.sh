@@ -18,10 +18,13 @@ echo "baixando de $URL"
 curl -fSL --retry 3 -o "$OUT.tmp" "$URL"
 
 if ! echo "$SHA256  $OUT.tmp" | sha256sum -c --status; then
-  echo "AVISO: checksum diferente do validado nesta maquina." >&2
+  echo "ERRO: checksum diferente do validado." >&2
   echo "  esperado: $SHA256" >&2
   echo "  obtido:   $(sha256sum "$OUT.tmp" | cut -d' ' -f1)" >&2
-  echo "O upstream pode ter republicado o modelo. Confira antes de usar." >&2
+  echo "O upstream aponta para a branch main e pode ter republicado o modelo." >&2
+  echo "Confira antes de usar; para aceitar mesmo assim: $0 --force" >&2
+  if [ "${1:-}" != "--force" ]; then rm -f "$OUT.tmp"; exit 1; fi
+  echo "--force: seguindo com o arquivo divergente." >&2
 fi
 
 mv "$OUT.tmp" "$OUT"

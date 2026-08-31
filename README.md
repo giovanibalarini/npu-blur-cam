@@ -34,89 +34,256 @@ roda dentro do navegador sobre CPU e GPU.
 
 ## Números medidos
 
-Custo de CPU do passo de segmentação por frame, a 1280×720:
+Todas as medições abaixo são a 1280×720, com `--cv-threads 1` (o padrão) e o
+pré-processamento corrigido. Onde a condição for outra, está dito.
 
-| Inferência em | Parede | CPU/frame | % de 1 core @30fps |
+### Onde a inferência roda
+
+Pipeline completo, uma corrida por destino:
+
+| Inferência em | CPU/frame | Parede | % de 1 núcleo @30fps |
 |---|---|---|---|
-| **NPU** | 3,07 ms | **5,30 ms** | 15,9% |
-| iGPU Arc 140V | 3,05 ms | 7,31 ms | 21,9% |
-| CPU | 5,64 ms | 19,52 ms | 58,6% |
+| **NPU** | **7,28 ms** | 8,45 ms | **22%** |
+| iGPU Arc 140V | 8,29 ms | 8,23 ms | 25% |
+| CPU | 21,35 ms | 10,90 ms | 64% |
 
-NPU e iGPU empatam em latência; a NPU ganha em CPU gasta para orquestrar.
+A NPU ganha da CPU por 42 pontos. Da iGPU, por três — praticamente empate. O
+argumento a favor da NPU não é velocidade: é que ela é o único bloco do chip que
+mais ninguém quer. Durante uma chamada, o processo gráfico do Chrome fica em ~22%
+de um núcleo e o Meet inteiro em ~74%; a NPU fica em 4% e sem fila.
 
-**Cuidado com esses percentuais:** eles são só do passo de segmentação. O
-processo inteiro custa **65,6% de um core** a 720p30 — o resto é decode MJPG,
-conversão BGR→RGB e escrita no loopback. Para decidir se vale rodar isto na sua
-máquina, o número é 66%, não 16%.
+### Custo do processo, em operação real
 
-Em operação: **29,8 fps**, 33,5 ms por frame, contador de ocupação da NPU entre
-3% e 4%. A chamada de inferência leva 0,94 ms de parede, 0,78 ms de engine
-ocupada. O gargalo é a câmera a 30 fps, não o acelerador.
+Os 22% acima são o trabalho de CPU por quadro, medido isolado. O processo inteiro
+custa mais, porque inclui a conversão RGB→I420 do `pyvirtualcam` e a escrita nos
+devices:
 
-Composição importa mais que o modelo: feather da máscara em 192×192 com
+| Estado | CPU do processo | NPU |
+|---|---|---|
+| consumidor em `NPU Blur Cam` | **45,6%** de um núcleo | ativa |
+| consumidor em `NPU Cam` | 32,3% | parada |
+| ninguém | **3,8%** | parada, webcam solta |
+
+**Para decidir se vale rodar isto na sua máquina, o número é 45,6%** durante a
+chamada e 3,8% no resto do tempo — não os 22% do benchmark.
+
+### Decomposição por etapa
+
+| Etapa | CPU/frame | Fatia |
+|---|---|---|
+| Decode MJPG da câmera | 4,74 ms | 65% |
+| `compose()` do blur | 1,47 ms | 20% |
+| `segment()`, inclui a chamada à NPU | 0,88 ms | 12% |
+| `cvtColor` BGR→RGB | 0,19 ms | 3% |
+| **soma** | **7,28 ms** | |
+
+**Dois terços do custo são decodificar o JPEG da webcam.** A chamada à NPU leva
+0,94 ms de parede, das quais 0,78 ms de engine ocupada — a etapa de IA é a mais
+barata do pipeline. Trocar MJPG por YUYV eliminaria o decode, mas webcams USB só
+oferecem YUYV em resoluções baixas: é limite de banda, não escolha.
+
+### Outros números
+
+Em operação: **29,8 fps**, 33,5 ms por quadro. O gargalo é a câmera a 30 fps, não
+o acelerador.
+
+Composição importa mais que o modelo: o feather da máscara em 192×192 com
 aritmética `uint8` custa 1,30 ms; o mesmo em 720p com `float32` custa 7,07 ms —
 5,4× de diferença. É a flag `--compose fast|float`.
 
+Resolução, pipeline completo com um thread: 640×360 custa 2,24 ms/quadro (7% de um
+núcleo), 720p custa 7,23 ms (22%), 1080p custa 16,18 ms (49%). Full HD sustenta
+30 fps — a parede de 17,4 ms cabe nos 33 — mas custa 2,24× e **não melhora a borda
+do recorte**, porque a máscara continua saindo em 192×192.
+
 ## Pré-requisitos
 
-Estes dois não são instalados pelo `install.sh`, porque ambos têm passos
-interativos ou dependem da versão exata do seu kernel.
+Nada aqui é opcional, e o `install.sh` **aborta** se faltar algo em vez de terminar
+dizendo "Feito" numa máquina onde o pipeline é impossível.
 
-**1. Driver de userspace da NPU.** Não está nos repositórios do Debian; o
-`apt install` não acha nada e não reclama. Baixe os `.deb` de
-[intel/linux-npu-driver](https://github.com/intel/linux-npu-driver) (os builds
-`ubuntu24.04` instalam limpo no trixie): `intel-level-zero-npu`,
-`intel-driver-compiler-npu`, `intel-fw-npu`. Confira depois:
+### 1. Pacotes do sistema
 
 ```bash
-ls /dev/accel/accel0                 # existe?
-groups | grep -q render || echo "adicione seu usuario ao grupo render"
+sudo apt install dkms build-essential "linux-headers-$(uname -r)" \
+                 v4l-utils curl git python3
 ```
 
-A biblioteca chama-se `libze_intel_npu.so` — procurar por `libze_intel_vpu.so`,
-como dizem receitas antigas, dá falso negativo.
+O `v4l-utils` importa mais do que parece: o `blur_cam.py` usa o `v4l2-ctl` para
+impedir que a webcam corte a taxa de quadros pela metade com pouca luz.
 
-**2. v4l2loopback 0.15.4 ou mais novo.** A 0.15.0 do Debian **não compila** em
-kernel ≥ 7.0 e, se você aplicar patches para compilar, ela derruba o kernel no
-primeiro `VIDIOC_QUERYCAP`. Use o upstream. Em Secure Boot, o módulo precisa da
-chave MOK aceita no firmware. Veja [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+**Atenção ao pacote de headers.** No Debian, `linux-headers-amd64` resolve para o
+kernel do repositório principal, não para o do backports. Use o nome exato que o
+`uname -r` devolve, como no comando acima.
+
+### 2. Grupos do usuário
+
+```bash
+sudo usermod -aG render,video "$USER"
+```
+
+`render` dá acesso a `/dev/accel/accel0` (a NPU) e `video` a `/dev/video*`. **Exige
+logout e login para valer** — `groups` só mostra o novo grupo na sessão seguinte. O
+instalador do Debian costuma pôr o primeiro usuário em `video`, mas nunca em
+`render`; um segundo usuário criado depois não recebe nenhum dos dois.
+
+### 3. Driver de userspace da NPU
+
+Não está nos repositórios do Debian — o `apt install` não encontra nada e não
+reclama. Baixe os `.deb` de
+[intel/linux-npu-driver](https://github.com/intel/linux-npu-driver/releases) (os
+builds `ubuntu24.04` instalam limpo no trixie) e instale com `apt`, não com
+`dpkg -i`, para as dependências serem resolvidas:
+
+```bash
+sudo apt install libze1
+sudo apt install ./intel-level-zero-npu_*.deb \
+                 ./intel-driver-compiler-npu_*.deb \
+                 ./intel-fw-npu_*.deb
+```
+
+Confira:
+
+```bash
+ls /dev/accel/accel0          # tem que existir
+groups | grep -q render && echo ok
+```
+
+A biblioteca chama-se `libze_intel_npu.so`. Procurar por `libze_intel_vpu.so`, como
+dizem receitas mais antigas, dá falso negativo e faz parecer que falhou.
+
+### 4. v4l2loopback 0.15.4 ou mais novo
+
+**Não use o pacote do Debian.** A versão empacotada é a 0.15.0, que não compila em
+kernel ≥ 7.0 e, se você aplicar patches para compilar, causa page fault no kernel no
+primeiro `VIDIOC_QUERYCAP` — travando todo aplicativo que liste webcams. Esse
+caminho está descrito em [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) §3
+justamente para você **não** segui-lo.
+
+```bash
+git clone https://github.com/umlaeute/v4l2loopback
+cd v4l2loopback
+git checkout v0.15.4
+sudo make install-dkms          # compila, assina e registra no DKMS
+```
+
+O `install-dkms` cuida do rebuild automático a cada kernel novo.
+
+**Se o Secure Boot estiver ativo**, o módulo precisa de uma chave aceita no
+firmware. O DKMS gera e assina sozinho, mas a chave só passa a valer depois de você
+confirmar numa tela azul durante o boot:
+
+```bash
+sudo mokutil --import /var/lib/dkms/mok.pub    # define uma senha de uso único
+sudo reboot                                     # MOK Manager → Enroll MOK → Continue → Yes → senha
+sudo mokutil --list-enrolled | grep DKMS        # confirme DEPOIS do reboot
+```
+
+Pular essa tela ou errar a senha **apaga o pedido silenciosamente**. Se o `grep` não
+achar nada, refaça o `--import` e reinicie.
 
 ## Instalação
 
 ```bash
 git clone https://github.com/giovanibalarini/npu-blur-cam
 cd npu-blur-cam
-./scripts/fetch-model.sh          # baixa o PPHumanSeg do opencv_zoo
-sudo ./install.sh                 # /opt/npu-blur-cam + nputop + unit + modprobe.d
+./scripts/fetch-model.sh          # baixa o PPHumanSeg do opencv_zoo e confere o sha256
+sudo ./install.sh                 # /opt + nputop + unit + modprobe.d, e carrega o módulo
 ```
 
-Depois, na sessão de **cada** usuário, sem root:
+O `install.sh` carrega o módulo ao final e imprime os dois devices criados. Depois,
+na sessão de **cada** usuário, sem root:
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now npu-blur-cam
+nputop --once
 ```
 
-No Meet ou Slack, escolha a câmera **"NPU Blur Cam"**.
+No Meet, Slack ou Teams, escolha **"NPU Blur Cam"** para desfoque ou **"NPU Cam"**
+para a imagem limpa.
 
-### Sem instalar nada no sistema
+> **A ordem importa.** Suba o pipeline **antes** de abrir o navegador. Enquanto
+> acordado, o serviço segura a webcam em exclusivo; se o Chrome pegá-la primeiro, o
+> serviço não consegue abri-la e morre com `nao consegui abrir /dev/video0`. Fechar
+> a aba que usa a câmera já resolve — não precisa fechar o navegador.
+
+Se algo falhar, o serviço loga no journal:
 
 ```bash
-python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
-./scripts/fetch-model.sh
-./venv/bin/python blur_cam.py --selftest      # nao precisa de camera nem loopback
+systemctl --user status npu-blur-cam
+journalctl --user -u npu-blur-cam -n 40
 ```
+
+### Rodando do clone, sem instalar em /opt
+
+Ainda precisa dos pré-requisitos 1 a 4 acima — inclusive o driver da NPU, porque o
+`--selftest` compila o modelo no acelerador antes de gerar os quadros sintéticos. O
+que ele dispensa é apenas a webcam e o v4l2loopback.
+
+```bash
+python3 -m venv venv || { python3 -m venv --without-pip venv && \
+  curl -fsSL https://bootstrap.pypa.io/get-pip.py | ./venv/bin/python; }
+./venv/bin/pip install -r requirements.txt
+./scripts/fetch-model.sh
+./venv/bin/python blur_cam.py --selftest
+```
+
+O `||` acima existe porque o Debian 13 não traz `ensurepip`: o módulo `venv` está
+presente, mas o bootstrap do pip não.
 
 ## Uso
 
 ```
-blur_cam.py                      # blur na NPU, 1280x720@30
-blur_cam.py --ov-device GPU      # compara com a iGPU
-blur_cam.py --ov-device CPU      # compara com a CPU
-blur_cam.py --compose float      # feather caro em 720p (5,4x mais lento)
-blur_cam.py --blur 31            # desfoque mais forte
+blur_cam.py                      # dois devices, blur na NPU, 1280x720@30
+blur_cam.py --no-raw             # so o device com blur, sem o de passagem
+blur_cam.py --ov-device GPU      # compara com a iGPU (ou CPU)
 blur_cam.py --selftest           # frames sinteticos, sem camera nem loopback
 ```
+
+Todas as opções:
+
+| Flag | Padrão | O que faz |
+|---|---|---|
+| `--cam` | `/dev/video0` | webcam de entrada |
+| `--out` | `/dev/video9` | device de saída **com** desfoque |
+| `--out-raw` | `/dev/video10` | device de passagem, sem desfoque |
+| `--no-raw` | — | não publica o device de passagem |
+| `--width` / `--height` | `1280` / `720` | resolução de captura e saída |
+| `--fps` | `30` | taxa alvo |
+| `--ov-device` | `NPU` | onde roda a inferência: `NPU`, `GPU` ou `CPU` |
+| `--blur` | `21` | força do desfoque (ímpar) |
+| `--smooth` | `0.6` | média móvel da máscara: `0` desliga, `0.9` é muito |
+| `--compose` | `fast` | `fast` = feather em 192×192 e uint8; `float` = em 720p e float32 (5,4× mais caro) |
+| `--cv-threads` | `1` | threads do OpenCV; `0` = automático. Ver a seção de CPU abaixo |
+| `--idle-after` | `5.0` | segundos sem consumidor antes de dormir; `0` desliga |
+| `--idle-fps` | `2.0` | taxa mantida nos devices sem consumidor |
+| `--selftest` | — | quadros sintéticos, sem câmera nem loopback |
+
+A variável de ambiente `NPU_BLUR_MODEL` sobrescreve o caminho do modelo; sem ela,
+ele é procurado em `models/pphumanseg.onnx` ao lado do script.
+
+**Mudar a resolução exige que ninguém esteja consumindo o device** — o v4l2loopback
+não deixa alterar o formato com um consumidor aberto, e o produtor continua
+silenciosamente no tamanho antigo. Ver TROUBLESHOOTING §7.
+
+### Passando opções para o serviço
+
+O `ExecStart` da unit é fixo. Para mudar:
+
+```bash
+systemctl --user edit npu-blur-cam
+```
+
+e no arquivo que abrir:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/opt/npu-blur-cam/venv/bin/python /opt/npu-blur-cam/blur_cam.py --blur 31
+```
+
+A linha `ExecStart=` vazia é obrigatória — sem ela o systemd soma os dois comandos
+em vez de substituir.
 
 ## nputop
 
@@ -136,29 +303,24 @@ além da stdlib.
 memória por processo, mas não tem campos `drm-engine-*`. Não existe tempo de NPU
 por processo — utilização só global.
 
-## Custo de CPU, e como ele foi reduzido
+## O pool de threads do OpenCV era desperdício
 
-O pipeline inteiro custava **51% de um núcleo**. Duas medições cortaram isso:
+O pipeline custava **51% de um núcleo** antes desta descoberta.
 
-**O pool de threads do OpenCV era desperdício.** Com os 8 threads padrão, o custo
-era 12,84 ms de CPU por frame para 8,47 ms de parede. Com `setNumThreads(1)`:
-7,28 ms de CPU para **exatamente os mesmos** 8,47 ms de parede. A paralelização
-gastava 43% mais CPU em sincronização para entregar a mesma latência, porque as
-operações são pequenas e o orçamento por frame (33 ms) é folgado. É o padrão
-agora; `--cv-threads 0` volta ao automático.
+| Threads do OpenCV | CPU/frame | Parede |
+|---|---|---|
+| 8 (padrão) | 12,84 ms | 8,47 ms |
+| 4 | 9,56 ms | 8,39 ms |
+| 2 | 8,19 ms | 8,32 ms |
+| **1** | **7,28 ms** | **8,47 ms** |
 
-**Onde vai a CPU restante**, medido a 1280×720 com um thread:
+A parede é **idêntica** nos dois extremos. A paralelização gastava 43% mais CPU em
+sincronização para entregar exatamente a mesma latência, porque as operações são
+pequenas e o orçamento por quadro (33 ms) é folgado. Um thread virou o padrão;
+`--cv-threads 0` volta ao automático.
 
-| Etapa | CPU/frame |
-|---|---|
-| Decode MJPG da câmera | 4,66 ms |
-| `segment()` — inclui a NPU | 3,15 ms |
-| `compose()` do blur | 4,53 ms |
-| `cvtColor` BGR→RGB | 0,19 ms |
-
-A inferência na NPU são 0,94 ms desse total: **7%**. O caro é decodificar e
-compor pixel. Trocar MJPG por YUYV eliminaria o decode, mas webcams USB só
-oferecem YUYV em resoluções baixas — é limite de banda, não escolha.
+Vale para qualquer pipeline de vídeo em tempo real com folga de latência: **se
+sobra parede, threads só custam.**
 
 ## Só se calcula o que alguém está olhando
 

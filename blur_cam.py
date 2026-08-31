@@ -118,9 +118,18 @@ def abrir_camera():
         return None
     # Sem isto a webcam corta a taxa pela metade no escuro para expor mais tempo:
     # 15 fps em vez de 30. O padrao do controle e 0, mas algo o liga.
-    subprocess.run(["v4l2-ctl", "-d", a.cam, "--set-ctrl", "exposure_dynamic_framerate=0"],
-                   capture_output=True)
+    try:
+        subprocess.run(["v4l2-ctl", "-d", a.cam, "--set-ctrl", "exposure_dynamic_framerate=0"],
+                       capture_output=True)
+    except FileNotFoundError:
+        if not abrir_camera.avisou:
+            print("  aviso: v4l2-ctl nao encontrado (pacote v4l-utils). A camera pode cair "
+                  "para 15 fps com pouca luz.", flush=True)
+            abrir_camera.avisou = True
     return cap
+
+
+abrir_camera.avisou = False
 
 
 def run_selftest():
