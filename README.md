@@ -5,11 +5,19 @@ Desfoque de fundo para videochamada com a segmentação rodando na **NPU Intel
 virtual V4L2.
 
 ```
-/dev/video0 (webcam) ──► blur_cam.py ──► /dev/video9 (v4l2loopback) ──► navegador
-                            │   ▲
-                            ▼   │  PPHumanSeg 192×192
-                          NPU (Intel AI Boost)
+                    ┌──► [PPHumanSeg na NPU] ──► compõe blur ──► /dev/video9   "NPU Blur Cam"
+/dev/video0 ────────┤
+   (webcam)         └──► repassa o quadro cru ─────────────────► /dev/video10  "NPU Cam"
 ```
+
+**Dois devices, e é assim que se desliga o desfoque.** Trocar entre "NPU Blur Cam" e
+"NPU Cam" no seletor de câmera do Meet, Slack ou Teams liga e desliga o blur — sem
+terminal, sem reiniciar, sem recarregar a aba. Os dois saem da mesma leitura da
+webcam, então alternar não disputa o `/dev/video0`.
+
+O botão de desfoque do **próprio Meet não funciona** para isso, e não tem conserto:
+ele atua sobre os quadros que já chegaram, e não tem como desfazer um desfoque que
+veio pronto na imagem. Por isso o seletor de câmera é o interruptor.
 
 Validado em Debian 13 (trixie), kernel 7.1.8, Core Ultra 9 288V (Lunar Lake).
 
@@ -151,6 +159,23 @@ agora; `--cv-threads 0` volta ao automático.
 A inferência na NPU são 0,94 ms desse total: **7%**. O caro é decodificar e
 compor pixel. Trocar MJPG por YUYV eliminaria o decode, mas webcams USB só
 oferecem YUYV em resoluções baixas — é limite de banda, não escolha.
+
+## Só se calcula o que alguém está olhando
+
+O processo detecta, uma vez por segundo, quem tem cada device aberto:
+
+| Consumidor | O que roda | CPU | NPU |
+|---|---|---|---|
+| `NPU Blur Cam` | pipeline completo | ~46% de um núcleo | ativa |
+| `NPU Cam` | só troca de espaço de cor | ~32% | **parada** |
+| Nenhum | dorme, solta a webcam | **~4%** | parada |
+
+O device sem consumidor continua recebendo quadros na taxa mínima — precisa, senão o
+`exclusive_caps` o devolve a *Video Output* e ele some da lista de câmeras.
+
+**O device com blur nunca entrega imagem limpa.** Sem consumidor, ele recebe o quadro
+inteiro desfocado, não o cru. O pior caso ao trocar para ele é ver tudo borrado por
+até um segundo — nunca a sua sala nítida.
 
 ## Modo ocioso
 

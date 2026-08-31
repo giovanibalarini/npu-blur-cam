@@ -138,3 +138,37 @@ nputop --once                                         # a NPU esta trabalhando?
 systemctl --user status npu-blur-cam
 journalctl --user -u npu-blur-cam -n 30
 ```
+
+## 6. Os rótulos das câmeras aparecem com aspas
+
+Sintoma: o Meet lista `NPU Blur Cam"` e `"NPU Cam`.
+
+O `card_label` do v4l2loopback leva **uma** string com vírgulas dentro, não uma lista
+de strings entre aspas. Escrever `card_label="A","B"` coloca as aspas literais nos
+rótulos.
+
+```
+# errado
+options v4l2loopback devices=2 card_label="NPU Blur Cam","NPU Cam"
+# certo
+options v4l2loopback devices=2 card_label="NPU Blur Cam,NPU Cam"
+```
+
+Corrigir exige recarregar o módulo — e o módulo só descarrega se ninguém tiver os
+devices abertos:
+
+```bash
+pkill -f "utility-sub-type=video[_]capture"   # o colchete evita o pkill se auto-matar
+systemctl --user stop npu-blur-cam
+sudo rmmod v4l2loopback && sudo modprobe v4l2loopback
+systemctl --user start npu-blur-cam
+```
+
+## 7. Mudar resolução não faz efeito
+
+O v4l2loopback **não deixa alterar o formato enquanto houver consumidor**. Trocar
+`--width/--height` e reiniciar o serviço não muda nada se o navegador estiver com o
+device aberto — o produtor pede o tamanho novo e continua silenciosamente no antigo.
+
+Sintoma: `v4l2-ctl --get-fmt-video` segue mostrando a resolução velha depois do
+restart. Mesma solução do item 6: tirar o consumidor primeiro.
