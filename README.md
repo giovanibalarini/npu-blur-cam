@@ -343,7 +343,7 @@ até um segundo — nunca a sua sala nítida.
 
 Por padrão o serviço **dorme quando ninguém está consumindo** a câmera virtual:
 não lê a webcam, não infere, não compõe, e **solta o `/dev/video0`** para outros
-aplicativos. Custo em repouso: **2,5% de um núcleo** contra 51% antes.
+aplicativos. Custo em repouso: **3,8% de um núcleo** contra 51% antes. (Eram 2,5% na versão de um device só; o segundo device custa os quadros de manutenção.)
 
 Ele continua repetindo o último quadro a 2 fps, e isso não é opcional — parar de
 transmitir faria o `exclusive_caps` devolver o device a *Video Output*, e ele
